@@ -505,7 +505,15 @@ impl<T: RepeatedItemTree> ModelChangeListener for RepeaterTracker<T> {
 
     fn reset(self: Pin<&Self>) {
         self.is_dirty.set(true);
-        self.inner.borrow_mut().instances.clear();
+        // Keep the instantiated components and mark them dirty instead of
+        // dropping them: the update pass reuses them for the new rows via
+        // `update(row, data)` and only splices the count difference. This
+        // avoids destroying and re-instantiating every instance when a model
+        // is reset (e.g. `VecModel::set_vec`), which dominated profiles of
+        // large repeaters.
+        for c in self.inner.borrow_mut().instances.iter_mut() {
+            c.0 = RepeatedInstanceState::Dirty;
+        }
     }
 }
 
@@ -561,7 +569,15 @@ impl<C: RepeatedItemTree + 'static> Repeater<C> {
             let old_model = model.get_internal();
             let m = model.get();
             if old_model != m {
-                *self.data().inner.borrow_mut() = RepeaterInner::default();
+                // Same recycling as `RepeaterTracker::reset`: keep the
+                // instantiated components and mark them dirty so the update
+                // pass reuses them for the new model's rows instead of
+                // dropping and re-instantiating all of them. Apps that
+                // replace the `ModelRc` wholesale on every data refresh hit
+                // this path for every repeated instance.
+                for c in self.data().inner.borrow_mut().instances.iter_mut() {
+                    c.0 = RepeatedInstanceState::Dirty;
+                }
                 self.data().is_dirty.set(true);
                 let peer = self.project_ref().0.model_peer();
                 m.model_tracker().attach_peer(peer);

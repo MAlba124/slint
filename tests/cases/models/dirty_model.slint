@@ -1,8 +1,10 @@
 // Copyright © SixtyFPS GmbH <info@slint.dev>
 // SPDX-License-Identifier: GPL-3.0-only OR LicenseRef-Slint-Royalty-free-2.0 OR LicenseRef-Slint-Software-3.0
 
-// Test that having the model being dirty doesn't re-create items
-// Only actually changing the model does.
+// Test that having the model being dirty doesn't re-create items.
+// Changing the model also doesn't re-create items: existing instances are
+// recycled for the new rows (only their data is updated, `init` does not
+// re-fire) — instances are only created for rows beyond the previous count.
 
 export component TestCase inherits Window {
     property <{xx: int, model :[string]}> model: { model: ["AA", "BB"] };
@@ -39,7 +41,7 @@ assert_eq!(instance.get_result(), "");
 slint_testing::send_mouse_click(&instance, 15., 5.);
 instance.invoke_change();
 slint_testing::send_mouse_click(&instance, 15., 5.);
-assert_eq!(instance.get_result(), "Init 'CC' (1)\n");
+assert_eq!(instance.get_result(), "");  // instance recycled for "CC": no init
 instance.set_result("".into());
 instance.invoke_mark_dirty();
 slint_testing::send_mouse_click(&instance, 15., 5.);
@@ -61,7 +63,7 @@ assert_eq(instance.get_result(), "");
 slint_testing::send_mouse_click(&instance, 15., 5.);
 instance.invoke_change();
 slint_testing::send_mouse_click(&instance, 15., 5.);
-assert_eq(instance.get_result(), "Init 'CC' (1)\n");
+assert_eq(instance.get_result(), "");  // instance recycled for "CC": no init
 instance.set_result("");
 instance.invoke_mark_dirty();
 slint_testing::send_mouse_click(&instance, 15., 5.);
@@ -82,7 +84,7 @@ assert.equal(instance.result, "");
 slintlib.private_api.send_mouse_click(instance, 15., 5.);
 instance.change();
 slintlib.private_api.send_mouse_click(instance, 15., 5.);
-assert.equal(instance.result, "Init 'CC' (1)\n");
+assert.equal(instance.result, "");  // instance recycled for "CC": no init
 instance.result = "";
 instance.mark_dirty();
 slintlib.private_api.send_mouse_click(instance, 15., 5.);
