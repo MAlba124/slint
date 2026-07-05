@@ -219,6 +219,23 @@ impl<'a> SkiaItemRenderer<'a> {
         width: PhysicalLength,
         height: PhysicalLength,
     ) -> Option<skia_safe::Paint> {
+        if brush.is_transparent() {
+            return None;
+        }
+
+        // Solid colors go through the paint color directly: a color shader
+        // heap-allocates an SkShader per drawn item and hides the constant
+        // color from Ganesh's fragment-processor analysis fast path.
+        if let Brush::SolidColor(color) = &brush {
+            let mut paint = self.default_paint().unwrap_or_default();
+            let layer_alpha = paint.alpha_f();
+            paint.set_color(to_skia_color(color));
+            if layer_alpha < 1.0 {
+                paint.set_alpha_f(paint.alpha_f() * layer_alpha);
+            }
+            return Some(paint);
+        }
+
         let (mut paint, shader) = Self::brush_to_shader(
             self.default_paint().unwrap_or_default(),
             brush,
