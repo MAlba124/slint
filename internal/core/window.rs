@@ -484,6 +484,15 @@ struct WindowPinnedFields {
     /// Gets dirty when the layout restrictions, or some other property of the windows change
     #[pin]
     window_properties_tracker: PropertyTracker<true, WindowPropertiesTracker>,
+    /// Gates [`WindowInner::ensure_tree_instantiated`]: the instantiation walk
+    /// evaluates inside this tracker, which thereby depends on every
+    /// repeater's model and dirty flag, every conditional's condition, and
+    /// every ListView's viewport properties. While none of those changed, the
+    /// walk (which visits every instantiated repeater instance in the app,
+    /// and used to run on every input event) is skipped entirely.
+    /// `NEEDS_SET_DIRTY` so `set_component` can force a walk of the new tree.
+    #[pin]
+    tree_instantiation_tracker: PropertyTracker<true>,
     #[pin]
     scale_factor: Property<f32>,
     #[pin]
@@ -532,6 +541,14 @@ pub struct WindowInner {
 
     /// Stack of currently active popups
     pub active_popups: RefCell<Vec<PopupWindow>>,
+    /// Guards [`Self::ensure_tree_instantiated`] against re-entrancy (an init
+    /// callback or change handler may land back in it, e.g. via
+    /// `set_focus_item`); the outer invocation's loop picks up whatever the
+    /// absorbed inner call would have done.
+    ensuring_tree: Cell<bool>,
+    /// The [`Self::popups_signature`] as of the last instantiation walk, so
+    /// popup open/close (not tracked by any property) forces a re-walk.
+    ensured_popups_signature: Cell<u64>,
     next_popup_id: Cell<NonZeroU32>,
     had_popup_on_press: Cell<bool>,
     close_requested: Callback<(), CloseRequestResponse>,
@@ -577,6 +594,7 @@ impl WindowInner {
             pinned_fields: Box::pin(WindowPinnedFields {
                 redraw_tracker,
                 window_properties_tracker,
+                tree_instantiation_tracker: Default::default(),
                 scale_factor: Property::new_named(1., "i_slint_core::Window::scale_factor"),
                 active: Property::new_named(false, "i_slint_core::Window::active"),
                 text_input_focused: Property::new_named(
@@ -592,6 +610,8 @@ impl WindowInner {
             last_ime_text: Default::default(),
             cursor_blinker: Default::default(),
             active_popups: Default::default(),
+            ensuring_tree: Default::default(),
+            ensured_popups_signature: Default::default(),
             next_popup_id: Cell::new(NonZeroU32::MIN),
             had_popup_on_press: Default::default(),
             close_requested: Default::default(),
@@ -611,6 +631,9 @@ impl WindowInner {
         self.touch_state.replace(Default::default());
         self.component.replace(ItemTreeRc::downgrade(component));
         self.pinned_fields.window_properties_tracker.set_dirty(); // component changed, layout constraints for sure must be re-calculated
+        // The new component's repeaters were never seen by the instantiation
+        // tracker, so force the next ensure_tree_instantiated to walk.
+        self.pinned_fields.tree_instantiation_tracker.set_dirty();
         let window_adapter = self.window_adapter();
         window_adapter.renderer().set_window_adapter(&window_adapter);
         let scale_factor = self.scale_factor();
@@ -640,24 +663,77 @@ impl WindowInner {
         self.component.borrow().upgrade()
     }
 
+    /// A cheap signature of the active-popup stack (length + ids), used to
+    /// notice popup open/close between instantiation walks — the popup list
+    /// is not a property, so the tree instantiation tracker can't see it.
+    fn popups_signature(&self) -> u64 {
+        let popups = self.active_popups.borrow();
+        popups.iter().fold(popups.len() as u64 + 1, |h, p| {
+            h.wrapping_mul(0x100000001b3).wrapping_add(p.popup_id.get() as u64)
+        })
+    }
+
     /// Walk the component tree and every active popup to materialize every
     /// Repeater, Conditional and ComponentContainer.  Runs change handlers
     /// and the instantiation pass in a loop because init callbacks may set
     /// properties that trigger change handlers, and change handlers may
     /// make new conditionals/repeaters dirty.
+    ///
+    /// The walk is O(all repeater instances in the app) and this is called on
+    /// every input event, so it evaluates inside `tree_instantiation_tracker`
+    /// and is skipped while no repeater model / dirty flag / conditional /
+    /// ListView viewport it read last time has changed (and the popup stack
+    /// is unchanged).
     pub fn ensure_tree_instantiated(&self) {
+        // Re-entrant calls (an init callback or change handler can land back
+        // here, e.g. via set_focus_item) are absorbed; this outer loop keeps
+        // walking as long as anything reports a change.
+        if self.ensuring_tree.replace(true) {
+            return;
+        }
+        // Reset the flag on scope exit, including unwinds out of user code
+        // run by the walk — a stuck flag would disable instantiation forever.
+        struct ResetOnDrop<'a>(&'a Cell<bool>);
+        impl Drop for ResetOnDrop<'_> {
+            fn drop(&mut self) {
+                self.0.set(false);
+            }
+        }
+        let _reset = ResetOnDrop(&self.ensuring_tree);
         // Instantiation runs first so that ListView's ensure_updated_listview
         // sees the model property before any change handler can reset it.
         for _ in 0..10 {
             let mut changed = false;
-            if let Some(component) = self.try_component() {
-                changed |= crate::item_tree::ensure_item_tree_instantiated(&component);
-            }
-            for popup in self.active_popups.borrow().iter() {
-                changed |= crate::item_tree::ensure_item_tree_instantiated(&popup.component);
+            let tracker = self.pinned_fields.as_ref().project_ref().tree_instantiation_tracker;
+            let popups_signature = self.popups_signature();
+            if tracker.is_dirty() || popups_signature != self.ensured_popups_signature.get() {
+                self.ensured_popups_signature.set(popups_signature);
+                // "converging": the walk itself dirties tracked properties
+                // (e.g. a model swap setting the repeater's dirty flag mid-
+                // walk), and those invalidations must survive the evaluation
+                // so the next loop iteration re-walks until nothing changes.
+                changed |= tracker.evaluate_as_dependency_root_converging(|| {
+                    let mut changed = false;
+                    if let Some(component) = self.try_component() {
+                        changed |= crate::item_tree::ensure_item_tree_instantiated(&component);
+                    }
+                    // Index-based iteration without holding the borrow: the
+                    // instantiation may run init code that opens/closes popups.
+                    let mut i = 0;
+                    while let Some(popup_component) =
+                        self.active_popups.borrow().get(i).map(|p| p.component.clone())
+                    {
+                        changed |= crate::item_tree::ensure_item_tree_instantiated(&popup_component);
+                        i += 1;
+                    }
+                    changed
+                });
             }
             changed |= crate::properties::ChangeTracker::run_change_handlers_once();
-            if !changed {
+            // Also loop while the tracker re-dirtied itself during the walk
+            // (e.g. a repeater's dirty flag flipping as it was serviced), so
+            // the state is fully settled before returning.
+            if !changed && !tracker.is_dirty() {
                 return;
             }
         }
@@ -1260,6 +1336,62 @@ impl WindowInner {
         let window_adapter = self.window_adapter();
         if let Some(window_adapter) = window_adapter.internal(crate::InternalToken) {
             window_adapter.handle_focus_change(old, new);
+        }
+    }
+
+    /// True if `item` lives in `tree` or in any tree nested (via repeaters /
+    /// conditionals / component containers) inside `tree`.
+    fn item_within_tree(item: &ItemRc, tree: &ItemTreeRc) -> bool {
+        let mut current = item.item_tree().clone();
+        loop {
+            if ItemTreeRc::ptr_eq(&current, tree) {
+                return true;
+            }
+            let mut parent = crate::item_tree::ItemWeak::default();
+            ItemTreeRc::borrow_pin(&current).as_ref().parent_node(&mut parent);
+            match parent.upgrade() {
+                Some(p) => current = p.item_tree().clone(),
+                None => return false,
+            }
+        }
+    }
+
+    /// Called by the repeater/conditional when it parks a live instance in its
+    /// reuse pool instead of destroying it. Replicates the side effects the
+    /// destruction path used to provide:
+    ///
+    /// * if the focus item lives in the parked tree, focus is taken from it
+    ///   with a real `FocusOut` — unlike destruction (where the item died
+    ///   unheard), the parked item survives to be revived, so its own focus
+    ///   state (`TextInput::has_focus`, cursor, `text-input-focused`, IME)
+    ///   must be reset;
+    /// * popups anchored inside the parked tree are closed — destruction did
+    ///   this in `unregister_item_tree` when the popup's `parent_item` no
+    ///   longer upgraded (e.g. a tooltip whose conditional turned false).
+    pub fn tree_parked(&self, tree: &ItemTreeRc) {
+        let focus_in_tree = self
+            .focus_item
+            .borrow()
+            .upgrade()
+            .is_some_and(|f| Self::item_within_tree(&f, tree));
+        if focus_in_tree {
+            self.take_focus_item(&FocusEvent::FocusOut(FocusReason::Programmatic));
+        }
+
+        if self.active_popups.borrow().is_empty() {
+            return;
+        }
+        let to_close = self
+            .active_popups
+            .borrow()
+            .iter()
+            .filter(|p| {
+                p.parent_item.upgrade().is_some_and(|pi| Self::item_within_tree(&pi, tree))
+            })
+            .map(|p| p.popup_id)
+            .collect::<Vec<_>>();
+        for popup_id in to_close {
+            self.close_popup(popup_id);
         }
     }
 

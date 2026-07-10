@@ -96,20 +96,23 @@ slint_testing::send_mouse_click(&instance, 95., 5.);
 assert_eq!(instance.get_r(), "clickR(2).");
 instance.set_r("".into());
 
+// The conditional parks its instance when the condition turns false and
+// revives the same one when it turns true again: local state (the cL
+// counter) survives and `init` does not re-fire.
 instance.set_value(48);
 assert_eq!(instance.get_r(), "");
 slint_testing::send_mouse_click(&instance, 5., 5.);
-assert_eq!(instance.get_r(), "initL(0).clickL(1).");
+assert_eq!(instance.get_r(), "clickL(2).");
 slint_testing::send_mouse_click(&instance, 95., 5.);
-assert_eq!(instance.get_r(), "initL(0).clickL(1).clickR(3).");
+assert_eq!(instance.get_r(), "clickL(2).clickR(3).");
 instance.set_r("".into());
 
 instance.set_value(49);
 assert_eq!(instance.get_r(), "");
 slint_testing::send_mouse_click(&instance, 5., 5.);
-assert_eq!(instance.get_r(), "clickL(2).");
+assert_eq!(instance.get_r(), "clickL(3).");
 slint_testing::send_mouse_click(&instance, 95., 5.);
-assert_eq!(instance.get_r(), "clickL(2).");
+assert_eq!(instance.get_r(), "clickL(3).");
 ```
 
 ```js
@@ -131,16 +134,16 @@ instance.r = "";
 instance.value = 48;
 assert.equal(instance.r, "");
 slintlib.private_api.send_mouse_click(instance, 5., 5.);
-assert.equal(instance.r, "initL(0).clickL(1).");
+assert.equal(instance.r, "clickL(2).");
 slintlib.private_api.send_mouse_click(instance, 95., 5.);
-assert.equal(instance.r, "initL(0).clickL(1).clickR(3).");
+assert.equal(instance.r, "clickL(2).clickR(3).");
 instance.r = "";
 
 instance.value = 49;
 assert.equal(instance.r, "");
 slintlib.private_api.send_mouse_click(instance, 5., 5.);
-assert.equal(instance.r, "clickL(2).");
+assert.equal(instance.r, "clickL(3).");
 slintlib.private_api.send_mouse_click(instance, 95., 5.);
-assert.equal(instance.r, "clickL(2).");
+assert.equal(instance.r, "clickL(3).");
 ```
 */

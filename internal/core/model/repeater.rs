@@ -94,13 +94,70 @@ enum RepeatedInstanceState {
 }
 struct RepeaterInner<C: RepeatedItemTree> {
     instances: Vec<(RepeatedInstanceState, Option<ItemTreeRc<C>>)>,
+    /// Fully-constructed instances parked here when the row count shrinks
+    /// (model shrink, ListView scroll-out, viewport cleanup) instead of being
+    /// destroyed. `ensure_updated` reuses them (via `update(row, data)`,
+    /// without re-firing `init`) before instantiating new ones, so an
+    /// oscillating row count stops paying instantiation + destruction —
+    /// including the `unregister_item_tree` work (per-item deinit, renderer
+    /// resource free, accessibility update) that made destruction expensive.
+    ///
+    /// Grows to the high-water mark of simultaneously live instances; it is
+    /// only emptied when the repeater itself is dropped. Parked instances are
+    /// not visited, rendered, or laid out, but they stay alive: their property
+    /// dependencies remain registered (harmless — bindings are lazy).
+    pool: Vec<ItemTreeRc<C>>,
     /// ListView-specific layout state (offset, cached heights, scroll position).
     layout_state: RepeaterLayoutState,
 }
 
 impl<C: RepeatedItemTree> Default for RepeaterInner<C> {
     fn default() -> Self {
-        RepeaterInner { instances: Default::default(), layout_state: Default::default() }
+        RepeaterInner {
+            instances: Default::default(),
+            pool: Default::default(),
+            layout_state: Default::default(),
+        }
+    }
+}
+
+/// Park the live instances in `range` into the pool instead of dropping them.
+///
+/// Runs [`crate::window::WindowInner::tree_parked`] for each parked instance
+/// at the same point where destruction used to happen, so the destruction
+/// path's observable side effects are kept: window focus held inside a parked
+/// instance is dropped, and popups anchored inside one (e.g. a tooltip whose
+/// conditional/row went away) are closed.
+fn park_instances<C: RepeatedItemTree>(
+    inner: &mut RepeaterInner<C>,
+    range: core::ops::Range<usize>,
+) {
+    // All instances of one repeater share a window; resolve it once per batch.
+    let mut window_adapter: Option<Option<crate::window::WindowAdapterRc>> = None;
+    for (_, c) in inner.instances.drain(range) {
+        if let Some(c) = c {
+            let wa = window_adapter.get_or_insert_with(|| {
+                let mut wa = None;
+                c.as_pin_ref().window_adapter(false, &mut wa);
+                wa
+            });
+            if let Some(wa) = wa {
+                crate::window::WindowInner::from_pub(wa.window())
+                    .tree_parked(&vtable::VRc::into_dyn(c.clone()));
+            }
+            inner.pool.push(c);
+        }
+    }
+}
+
+/// Tell the instance's window (if it is attached to one) that this tree is
+/// being parked, so focus/popup state anchored inside it is released.
+fn notify_parked<C: RepeatedItemTree>(instance: &ItemTreeRc<C>) {
+    let mut window_adapter = None;
+    instance.as_pin_ref().window_adapter(false, &mut window_adapter);
+    if let Some(window_adapter) = window_adapter {
+        crate::window::WindowInner::from_pub(window_adapter.window())
+            .tree_parked(&vtable::VRc::into_dyn(instance.clone()));
     }
 }
 
@@ -352,32 +409,43 @@ impl<C: RepeatedItemTree> RepeaterInstanceOps for RustRepeaterOps<'_, C> {
     }
 
     fn splice(&mut self, position: usize, remove: usize, add: usize) {
-        self.inner.borrow_mut().instances.splice(
-            position..position + remove,
+        let mut inner = self.inner.borrow_mut();
+        let inner = &mut *inner;
+        park_instances(inner, position..position + remove);
+        inner.instances.splice(
+            position..position,
             core::iter::repeat_with(|| (RepeatedInstanceState::Dirty, None)).take(add),
         );
     }
 
     fn ensure_updated(&mut self, instance_idx: usize, row: usize) -> bool {
-        let (created, instance) = {
+        let (materialized, fresh, instance) = {
             let mut inner = self.inner.borrow_mut();
+            let inner = &mut *inner;
             let c = &mut inner.instances[instance_idx];
             if c.0 != RepeatedInstanceState::Dirty {
                 return false;
             }
-            let created = c.1.is_none();
-            if created {
-                c.1 = Some((self.init)());
+            let materialized = c.1.is_none();
+            let mut fresh = false;
+            if materialized {
+                // Reuse a parked instance before building a new one. A reused
+                // instance keeps its local state and does not re-fire `init`
+                // (same semantics as the in-place recycling on model reset).
+                c.1 = Some(inner.pool.pop().unwrap_or_else(|| {
+                    fresh = true;
+                    (self.init)()
+                }));
             }
             c.1.as_ref().unwrap().update(row, self.model.row_data(row).unwrap_or_default());
             c.0 = RepeatedInstanceState::Clean;
-            (created, c.1.as_ref().unwrap().clone())
+            (materialized, fresh, c.1.as_ref().unwrap().clone())
         };
-        if created {
+        if fresh {
             crate::properties::evaluate_no_tracking(|| instance.init());
         }
         crate::item_tree::ensure_item_tree_instantiated(&vtable::VRc::into_dyn(instance));
-        created
+        materialized
     }
 
     fn height(&self, instance_idx: usize) -> Option<Coord> {
@@ -496,7 +564,8 @@ impl<T: RepeatedItemTree> ModelChangeListener for RepeaterTracker<T> {
             count = inner.instances.len() - index;
         }
         self.is_dirty.set(true);
-        inner.instances.drain(index..(index + count));
+        let inner = &mut *inner;
+        park_instances(inner, index..(index + count));
         for c in inner.instances[index..].iter_mut() {
             // Because all the indexes are dirty
             c.0 = RepeatedInstanceState::Dirty;
@@ -611,9 +680,16 @@ impl<C: RepeatedItemTree + 'static> Repeater<C> {
     /// Recurse into child instances to ensure they are instantiated.
     fn ensure_children_instantiated(&self) -> bool {
         let mut changed = false;
-        for instance in self.instances_vec() {
-            changed |=
-                crate::item_tree::ensure_item_tree_instantiated(&vtable::VRc::into_dyn(instance));
+        // Index-based walk with a short borrow per instance (ensure_instantiated
+        // may re-enter the model), statically dispatched — the previous
+        // `instances_vec()` allocated a Vec and cloned every instance's VRc on
+        // every update pass.
+        let count = self.0.inner.borrow().instances.len();
+        for i in 0..count {
+            let c = self.0.inner.borrow().instances.get(i).and_then(|c| c.1.clone());
+            if let Some(c) = c {
+                changed |= c.as_pin_ref().ensure_instantiated();
+            }
         }
         changed
     }
@@ -650,7 +726,17 @@ impl<C: RepeatedItemTree + 'static> Repeater<C> {
         listview_width: LogicalLength,
         listview_height: Pin<&Property<LogicalLength>>,
     ) -> bool {
-        self.data().project_ref().is_dirty.set(false);
+        // Read the dirty flag before clearing it: the read registers it as a
+        // dependency of the window's tree-instantiation tracker (this runs
+        // inside its evaluation), so row additions/removals — which only set
+        // this flag — wake the gated instantiation walk.
+        // Read the dirty flag before clearing it: the read registers it as a
+        // dependency of the window's tree-instantiation tracker (this runs
+        // inside its evaluation), so row additions/removals — which only set
+        // this flag — wake the gated instantiation walk.
+        if self.data().project_ref().is_dirty.get() {
+            self.data().project_ref().is_dirty.set(false);
+        }
 
         let model = self.model();
         let row_count = model.row_count();
@@ -758,6 +844,11 @@ pub struct Conditional<C: RepeatedItemTree> {
     #[pin]
     instance_generation: Property<()>,
     instance: RefCell<Option<ItemTreeRc<C>>>,
+    /// The instance parked here when the condition turns false, so toggling
+    /// the condition doesn't destroy and re-instantiate the subtree. Like a
+    /// repeater's pool: a revived instance keeps its local state and does not
+    /// re-fire `init`.
+    parked: RefCell<Option<ItemTreeRc<C>>>,
 }
 
 impl<C: RepeatedItemTree> Default for Conditional<C> {
@@ -769,6 +860,7 @@ impl<C: RepeatedItemTree> Default for Conditional<C> {
                 "i_slint_core::Conditional::instance_generation",
             ),
             instance: RefCell::new(None),
+            parked: RefCell::new(None),
         }
     }
 }
@@ -794,11 +886,25 @@ impl<C: RepeatedItemTree + 'static> Conditional<C> {
         let model = self.project_ref().model.get();
 
         let changed = if !model {
-            self.instance.take().is_some()
+            match self.instance.take() {
+                Some(i) => {
+                    // Park the instance instead of destroying it so the next
+                    // toggle-on revives it (keeping its local state, without
+                    // re-firing `init`).
+                    notify_parked(&i);
+                    self.parked.replace(Some(i));
+                    true
+                }
+                None => false,
+            }
         } else if self.instance.borrow().is_none() {
-            let i = init();
-            self.instance.replace(Some(i.clone()));
-            i.init();
+            if let Some(i) = self.parked.take() {
+                self.instance.replace(Some(i));
+            } else {
+                let i = init();
+                self.instance.replace(Some(i.clone()));
+                i.init();
+            }
             true
         } else {
             false

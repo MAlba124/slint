@@ -85,7 +85,10 @@ instance.global::<Glob<'_>>().on_clicked(move |val|{
 });
 slint_testing::send_mouse_click(&instance, 150., 150.);
 assert_eq!(instance.global::<Glob<'_>>().get_value(), "world");
-assert_eq!(instance.global::<Glob<'_>>().get_value_after(), "");
+// The removed row's instance is parked (not destroyed), so the rest of the
+// callback still reads its model-data copy instead of the two-way binding's
+// dead-weak default.
+assert_eq!(instance.global::<Glob<'_>>().get_value_after(), "world");
 ```
 
 // same thing but with the keyboard
@@ -105,7 +108,8 @@ slint_testing::send_keyboard_string_sequence(&instance, " ");
 slint_testing::send_keyboard_string_sequence(&instance, " ");
 slint_testing::send_keyboard_string_sequence(&instance, "\t");
 assert_eq!(instance.global::<Glob<'_>>().get_value(), "world");
-assert_eq!(instance.global::<Glob<'_>>().get_value_after(), "");
+// See the mouse variant: the parked instance keeps its model-data copy.
+assert_eq!(instance.global::<Glob<'_>>().get_value_after(), "world");
 ```
 
 ```cpp

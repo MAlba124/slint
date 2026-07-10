@@ -1473,6 +1473,25 @@ impl<const NEEDS_SET_DIRTY: bool, DirtyHandler: PropertyDirtyHandler>
         r
     }
 
+    /// Like [`Self::evaluate_as_dependency_root`], but the dirty flag is
+    /// cleared *before* running `f` instead of after, so an invalidation of a
+    /// tracked property raised while `f` itself runs is preserved instead of
+    /// being swallowed by the trailing clear. For callers that loop on
+    /// [`Self::is_dirty`] until the evaluation converges (e.g. the window's
+    /// tree-instantiation walk, where updating a repeater flips its own
+    /// tracked dirty flag mid-walk).
+    pub fn evaluate_as_dependency_root_converging<R>(
+        self: Pin<&Self>,
+        f: impl FnOnce() -> R,
+    ) -> R {
+        // clear all the nodes so that we can start from scratch
+        unsafe { *self.holder.dep_nodes.get() = Default::default() };
+
+        self.holder.dirty.set(false);
+        let holder_ptr = &raw const self.holder as *const BindingHolder;
+        current_binding_storage::set(Some(holder_ptr), f)
+    }
+
     /// Call [`Self::evaluate`] if and only if it is dirty.
     /// But register a dependency in any case.
     pub fn evaluate_if_dirty<R>(self: Pin<&Self>, f: impl FnOnce() -> R) -> Option<R> {

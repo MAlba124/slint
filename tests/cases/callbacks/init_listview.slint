@@ -1,7 +1,13 @@
 // Copyright © SixtyFPS GmbH <info@slint.dev>
 // SPDX-License-Identifier: GPL-3.0-only OR LicenseRef-Slint-Royalty-free-2.0 OR LicenseRef-Slint-Software-3.0
 
-// Verify that the init callback is invoked in the correct order
+// Verify that the init callback is invoked in the correct order.
+//
+// With the repeater instance pool, `init` fires once per *physical* instance:
+// rows scrolling into view reuse instances parked when other rows scrolled
+// out, and reused instances do not re-fire `init` (same semantics as
+// recycled instances on model reset). Only genuinely new instances —
+// growing past the pool's high-water mark — fire it.
 
 
 import { ListView } from "std-widgets.slint";
@@ -25,17 +31,21 @@ let instance = TestCase::new().unwrap();
 slint_testing::send_mouse_click(&instance, 5., 5.);
 assert_eq!(instance.get_result(), "(0)(1)(2)");
 instance.set_result("".into());
+// Rows 3 and 4 scroll in before anything was parked: fresh instances, init fires.
 instance.set_scroll(-150.);
 slint_testing::send_mouse_click(&instance, 5., 5.);
 assert_eq!(instance.get_result(), "(3)(4)");
 instance.set_result("".into());
+// Random seek: all previous instances are parked and reused for rows 10-12,
+// so no init fires.
 instance.set_scroll(-1000.);
 slint_testing::send_mouse_click(&instance, 5., 5.);
-assert_eq!(instance.get_result(), "(10)(11)(12)");
+assert_eq!(instance.get_result(), "");
 instance.set_result("".into());
+// Scrolling back up reuses parked instances for rows 9 and 8 as well.
 instance.set_scroll(-850.);
 slint_testing::send_mouse_click(&instance, 5., 5.);
-assert_eq!(instance.get_result(), "(9)(8)");
+assert_eq!(instance.get_result(), "");
 
 
 ```
@@ -73,11 +83,11 @@ assert.equal(instance.result, "(3)(4)");
 instance.result = "";
 instance.scroll = -1000.;
 slintlib.private_api.send_mouse_click(instance, 5., 5.);
-assert.equal(instance.result, "(10)(11)(12)");
+assert.equal(instance.result, "");
 instance.result = "";
 instance.scroll = -850.;
 slintlib.private_api.send_mouse_click(instance, 5., 5.);
-assert.equal(instance.result, "(9)(8)");
+assert.equal(instance.result, "");
 ```
 
 
